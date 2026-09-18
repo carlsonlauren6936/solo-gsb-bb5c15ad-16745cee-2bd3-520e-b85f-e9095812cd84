@@ -18,6 +18,10 @@
 **整个 IPv4 空间**上的最终判定是否等价，并按 left/right 动作分组给出
 判定不同的地址集合及其最少 CIDR 表示。
 
+`POST /explain` 解释一段 IPv4 地址空间（`query`）由哪条规则或默认动作
+最终裁决：仅在 query 范围内按规则索引归因，未命中部分归于
+`default_action`，各项不重不漏覆盖整个 query。
+
 > 遮蔽来源不区分动作：先前的 **allow 与 deny 规则取并集**，共同遮蔽后续规则。
 
 ---
@@ -33,6 +37,7 @@ docker compose up --build -d
 - **API 基础地址：** http://localhost:8000
 - **分析接口：** `POST http://localhost:8000/analyze`
 - **比较接口：** `POST http://localhost:8000/compare`
+- **解释接口：** `POST http://localhost:8000/explain`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
 - **OpenAPI Schema：** http://localhost:8000/openapi.json
 - **健康检查：** http://localhost:8000/health
@@ -306,12 +311,128 @@ curl -s http://localhost:8000/compare \
   }'
 ```
 
+---
+
+### `POST /explain`
+
+解释一段 IPv4 地址空间（`query`）由哪条规则或默认动作最终裁决。沿用
+`/analyze` 的 CIDR 校验与**首条匹配规则生效**的顺序语义，仅在 query
+范围内归因：每条规则分到的是其未被此前规则覆盖、且落在 query 内的
+地址；未命中任何规则的部分归于 `default_action`。
+
+#### 请求体
+
+```json
+{
+  "rules": [
+    {"action": "allow", "cidr": "10.0.0.0/8"},
+    {"action": "deny",  "cidr": "10.1.0.0/16"},
+    {"action": "deny",  "cidr": "10.0.0.0/7"}
+  ],
+  "default_action": "allow",
+  "query": "10.0.0.0/7"
+}
+```
+
+- `rules`：**有序**规则列表（按数组顺序逐条处理），**允许为空** `[]`；
+  每条规则的 `action` / `cidr` 校验规则与 `/analyze` 完全一致。
+- `default_action`：**必填**，未命中任何规则时的默认动作，仅允许
+  `allow` / `deny`（大小写不敏感，会规范化为小写）。
+- `query`：**必填**，待解释的单个 IPv4 CIDR；纯 IP 按 `/32` 处理；
+  主机位必须为零；禁止 IPv6。
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `query` | 规范化后的查询 CIDR |
+| `total_addresses` | 查询范围内的地址总数 |
+| `attribution[]` | 裁决归属列表：**不重不漏**覆盖整个 query，按规则索引升序、默认项最后 |
+| `attribution[].source` | `rule` 表示命中规则，`default` 表示未命中走默认动作 |
+| `attribution[].rule_index` | 命中规则在输入中的序号（从 0 开始）；默认项为 `null` |
+| `attribution[].action` | 该项地址的最终动作（`allow` / `deny`） |
+| `attribution[].address_count` | 该项覆盖的地址数（各项之和 = `total_addresses`） |
+| `attribution[].cidrs` | 该项地址集合**无损压缩后的最少 CIDR 列表** |
+
+被此前规则完全遮蔽、或与 query 无交集的规则不会出现在归因列表中；
+query 被规则完全覆盖时无默认项。整个计算基于整数区间归并，
+**不逐地址枚举**。
+
+#### 响应示例（200）
+
+上例中 `deny 10.1.0.0/16` 被规则 0 完全遮蔽；`deny 10.0.0.0/7` 只有
+`11.0.0.0/8` 未被规则 0 覆盖；query 内无未命中地址，故无默认项：
+
+```json
+{
+  "query": "10.0.0.0/7",
+  "total_addresses": 33554432,
+  "attribution": [
+    {
+      "source": "rule",
+      "rule_index": 0,
+      "action": "allow",
+      "address_count": 16777216,
+      "cidrs": ["10.0.0.0/8"]
+    },
+    {
+      "source": "rule",
+      "rule_index": 2,
+      "action": "deny",
+      "address_count": 16777216,
+      "cidrs": ["11.0.0.0/8"]
+    }
+  ]
+}
+```
+
+#### 响应示例（含默认项）
+
+`allow 10.0.0.0/9` 只覆盖 query 的前一半，其余地址未命中任何规则，
+归于 `default_action`（`rule_index` 为 `null`）且排在最后：
+
+```json
+{
+  "query": "10.0.0.0/8",
+  "total_addresses": 16777216,
+  "attribution": [
+    {
+      "source": "rule",
+      "rule_index": 0,
+      "action": "allow",
+      "address_count": 8388608,
+      "cidrs": ["10.0.0.0/9"]
+    },
+    {
+      "source": "default",
+      "rule_index": null,
+      "action": "deny",
+      "address_count": 8388608,
+      "cidrs": ["10.128.0.0/9"]
+    }
+  ]
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/explain \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rules": [{"action":"allow","cidr":"10.0.0.0/9"}],
+    "default_action": "deny",
+    "query": "10.0.0.0/8"
+  }'
+```
+
 ### 错误响应（422 Unprocessable Entity）
 
 以下输入均返回 HTTP `422`，错误明细位于 `detail`：
 
 - 空规则集（仅 `/analyze`）：`{"rules": []}` 或缺少 `rules`
 - `/compare` 缺少 `left` / `right`，或任一侧缺少 `default_action`
+- `/explain` 缺少 `query` 或 `default_action`
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
 - IPv6 地址或网段：`2001:db8::/32`、`::1` 等
 - 非法 / 缺失 `action` 或 `default_action`、字段类型错误、JSON 格式错误
@@ -335,9 +456,9 @@ pytest -q
 
 测试覆盖：解析校验（含 IPv6 拒绝）、区间差集与合并、最少 CIDR 压缩、
 三种遮蔽分类、跨动作遮蔽、顺序敏感性，`/compare` 的等价判定、顺序/默认
-动作差异、双向分组与全空间压缩，以及用标准库
-`ipaddress.collapse_addresses` 作为 oracle 的随机属性测试（无损 + 最少块，
-并与逐地址暴力判定对比）。
+动作差异、双向分组与全空间压缩，`/explain` 的归因归属、默认项位置与
+query 裁剪，以及用标准库 `ipaddress.collapse_addresses` 作为 oracle 的
+随机属性测试（无损 + 最少块，并与逐地址暴力判定对比）。
 
 ---
 
@@ -347,8 +468,8 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析与等价比较
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare 接口
+│   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较与裁决解释
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain 接口
 ├── tests/
 │   ├── test_analyzer.py
 │   └── test_api.py
@@ -370,5 +491,9 @@ pytest -q
   分区，交叠处动作不同即记入对应 `(left_action, right_action)` 分组；
   分组碎片同样走“合并 + 贪心切块”。时间复杂度仅取决于区间数量，
   **不逐地址枚举**，可安全处理 `0.0.0.0/0` 全空间。
+- **裁决解释**：第 *i* 条规则的归因集合 = 其 CIDR 与 query 的交集减去
+  前 *i-1* 条规则覆盖的并集；query 内未被任何规则命中的碎片归
+  `default_action`。规则项按索引升序输出、默认项最后，各项碎片经
+  “合并 + 贪心切块”压缩后**不重不漏**覆盖整个 query。
 - **整数运算**：全部基于 32 位无符号整数区间处理，避免字符串/对象开销，
   可正确支持 `0.0.0.0/0` 全空间等边界场景。

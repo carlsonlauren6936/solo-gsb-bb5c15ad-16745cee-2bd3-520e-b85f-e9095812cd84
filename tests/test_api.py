@@ -14,6 +14,13 @@ def post_compare(left, right):
     return client.post("/compare", json={"left": left, "right": right})
 
 
+def post_explain(rules, default_action, query):
+    return client.post(
+        "/explain",
+        json={"rules": rules, "default_action": default_action, "query": query},
+    )
+
+
 def test_root_and_health():
     assert client.get("/").status_code == 200
     assert client.get("/health").json() == {"status": "ok"}
@@ -226,3 +233,103 @@ def test_compare_validation_422():
     # 缺少一侧 / 请求体为空
     assert client.post("/compare", json={"left": base}).status_code == 422
     assert client.post("/compare", json={}).status_code == 422
+
+
+# ---------- /explain ----------
+
+def test_explain_basic_first_match_attribution():
+    resp = post_explain(
+        [
+            {"action": "allow", "cidr": "10.0.0.0/8"},
+            {"action": "deny", "cidr": "10.1.0.0/16"},  # 被规则 0 遮蔽
+            {"action": "deny", "cidr": "10.0.0.0/7"},
+        ],
+        "allow",
+        "10.0.0.0/7",
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["query"] == "10.0.0.0/7"
+    assert body["total_addresses"] == 1 << 25
+    assert body["attribution"] == [
+        {
+            "source": "rule",
+            "rule_index": 0,
+            "action": "allow",
+            "address_count": 1 << 24,
+            "cidrs": ["10.0.0.0/8"],
+        },
+        {
+            "source": "rule",
+            "rule_index": 2,
+            "action": "deny",
+            "address_count": 1 << 24,
+            "cidrs": ["11.0.0.0/8"],
+        },
+    ]
+
+
+def test_explain_default_item_last_and_case_insensitive():
+    resp = post_explain(
+        [{"action": "ALLOW", "cidr": "10.0.0.0/9"}],
+        "Deny",
+        "10.0.0.0/8",
+    )
+    assert resp.status_code == 200
+    assert resp.json()["attribution"] == [
+        {
+            "source": "rule",
+            "rule_index": 0,
+            "action": "allow",
+            "address_count": 1 << 23,
+            "cidrs": ["10.0.0.0/9"],
+        },
+        {
+            "source": "default",
+            "rule_index": None,
+            "action": "deny",
+            "address_count": 1 << 23,
+            "cidrs": ["10.128.0.0/9"],
+        },
+    ]
+
+
+def test_explain_bare_ip_query_and_empty_rules():
+    resp = post_explain([], "allow", "8.8.8.8")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["query"] == "8.8.8.8/32"
+    assert body["total_addresses"] == 1
+    assert body["attribution"] == [
+        {
+            "source": "default",
+            "rule_index": None,
+            "action": "allow",
+            "address_count": 1,
+            "cidrs": ["8.8.8.8/32"],
+        }
+    ]
+
+
+def test_explain_validation_422():
+    # 非法 / IPv6 query
+    for bad in ["10.0.0.1/8", "10.0.0.0/33", "2001:db8::/32", "garbage"]:
+        assert post_explain([], "deny", bad).status_code == 422, bad
+
+    # 非法规则 CIDR / action / default_action（沿用现有校验）
+    assert post_explain(
+        [{"action": "allow", "cidr": "10.0.0.1/8"}], "deny", "10.0.0.0/8"
+    ).status_code == 422
+    assert post_explain(
+        [{"action": "permit", "cidr": "10.0.0.0/8"}], "deny", "10.0.0.0/8"
+    ).status_code == 422
+    assert post_explain([], "permit", "10.0.0.0/8").status_code == 422
+
+    # 缺少 default_action / query / 请求体为空
+    assert client.post(
+        "/explain", json={"rules": [], "query": "10.0.0.0/8"}
+    ).status_code == 422
+    assert client.post(
+        "/explain", json={"rules": [], "default_action": "deny"}
+    ).status_code == 422
+    assert client.post("/explain", json={}).status_code == 422

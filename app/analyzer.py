@@ -205,6 +205,71 @@ def analyze_rules(
     }
 
 
+def explain_query(
+    rules: Sequence[tuple[str, str]],
+    default_action: str,
+    query: str,
+) -> dict:
+    """解释一段 IPv4 地址空间在规则集下的最终裁决归属。
+
+    沿用“首条匹配规则生效”语义，仅在 ``query`` 范围内归因：第 i 条
+    规则分到的地址 = 其 CIDR 与 query 的交集，减去此前所有规则
+    （allow/deny 不区分）覆盖地址的并集；query 内未被任何规则命中的
+    部分归于 ``default_action``。
+
+    返回可直接 JSON 序列化的字典，``attribution`` 各项互不重叠且完整
+    覆盖 query，按规则索引升序排列，默认项（若存在）位于最后；每项的
+    地址集合均无损压缩为数量最少的 CIDR 列表。整个过程只做区间运算，
+    不逐地址枚举。
+    """
+    default_action = normalize_action(default_action)
+    q_start, q_end, q_cidr = parse_cidr_v4(query)
+
+    covered: list[tuple[int, int]] = []
+    # (规则索引, 动作, query 内归属该规则的碎片) —— 按索引升序收集
+    hits: list[tuple[int, str, list[tuple[int, int]]]] = []
+
+    for index, (action, raw_cidr) in enumerate(rules):
+        action = normalize_action(action)
+        start, end, _ = parse_cidr_v4(raw_cidr)
+        # 只关心 query 范围内的归属；遮蔽并集仍按完整规则 CIDR 累积
+        lo, hi = max(start, q_start), min(end, q_end)
+        frags = subtract_covered((lo, hi), covered) if lo <= hi else []
+        if frags:
+            hits.append((index, action, frags))
+        covered = merge_intervals([*covered, (start, end)])
+
+    attribution = [
+        {
+            "source": "rule",
+            "rule_index": index,
+            "action": action,
+            "address_count": sum(b - a + 1 for a, b in frags),
+            "cidrs": compress_intervals(frags),
+        }
+        for index, action, frags in hits
+    ]
+
+    # query 内未命中任何规则的部分归于默认动作，排在最后
+    default_frags = subtract_covered((q_start, q_end), covered)
+    if default_frags:
+        attribution.append(
+            {
+                "source": "default",
+                "rule_index": None,
+                "action": default_action,
+                "address_count": sum(b - a + 1 for a, b in default_frags),
+                "cidrs": compress_intervals(default_frags),
+            }
+        )
+
+    return {
+        "query": q_cidr,
+        "total_addresses": q_end - q_start + 1,
+        "attribution": attribution,
+    }
+
+
 def build_decision_intervals(
     rules: Sequence[tuple[str, str]],
     default_action: str,

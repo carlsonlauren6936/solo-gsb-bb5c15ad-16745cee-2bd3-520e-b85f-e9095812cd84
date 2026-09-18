@@ -10,6 +10,7 @@ from .analyzer import (
     InvalidCIDRError,
     analyze_rules,
     compare_rule_sets,
+    explain_query,
     parse_cidr_v4,
 )
 
@@ -19,9 +20,10 @@ app = FastAPI(
         "接收有序的 allow/deny CIDR 规则，计算每条规则未被此前规则覆盖的"
         "地址集合，按 **全生效 (full)** / **部分遮蔽 (partial)** / "
         "**完全遮蔽 (shadowed)** 分类，并将剩余集合无损压缩为数量最少的 CIDR；"
-        "也可通过 /compare 比较两组规则在整个 IPv4 空间上的最终判定是否等价。"
+        "也可通过 /compare 比较两组规则在整个 IPv4 空间上的最终判定是否等价，"
+        "或通过 /explain 解释一段地址空间由哪条规则或默认动作最终裁决。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -130,6 +132,60 @@ class CompareResponse(BaseModel):
     )
 
 
+class ExplainRequest(BaseModel):
+    """解释请求：有序规则列表 + 默认动作 + 单个待解释的查询 CIDR。"""
+
+    rules: list[Rule] = Field(
+        default_factory=list, description="有序规则列表（按序处理），可为空"
+    )
+    default_action: Literal["allow", "deny"] = Field(
+        ...,
+        description="未命中任何规则时的默认动作（大小写不敏感）",
+    )
+    query: str = Field(
+        ...,
+        description="待解释的 IPv4 CIDR，如 10.0.0.0/8；纯 IP 按 /32 处理；禁止 IPv6",
+    )
+
+    @field_validator("default_action", mode="before")
+    @classmethod
+    def normalize_default_action(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        # 校验并规范化；非法 CIDR / IPv6 抛出 ValueError -> 422
+        return parse_cidr_v4(value)[2]
+
+
+class AttributionItem(BaseModel):
+    source: Literal["rule", "default"] = Field(
+        ..., description="裁决来源：rule 命中规则，default 未命中走默认动作"
+    )
+    rule_index: int | None = Field(
+        ..., description="命中规则在输入中的序号（从 0 开始）；默认项为 null"
+    )
+    action: Literal["allow", "deny"]
+    address_count: int = Field(..., description="该项覆盖的地址数")
+    cidrs: list[str] = Field(
+        ..., description="该项地址集合无损压缩后的最少 CIDR 列表"
+    )
+
+
+class ExplainResponse(BaseModel):
+    query: str = Field(..., description="规范化后的查询 CIDR")
+    total_addresses: int = Field(..., description="查询范围内的地址总数")
+    attribution: list[AttributionItem] = Field(
+        ...,
+        description=(
+            "裁决归属列表：不重不漏覆盖 query，按规则索引升序，默认项最后"
+        ),
+    )
+
+
 @app.get("/", tags=["meta"])
 def root() -> dict:
     """服务信息。"""
@@ -185,6 +241,32 @@ def compare(request: CompareRequest) -> dict:
             request.left.default_action,
             [(r.action, r.cidr) for r in request.right.rules],
             request.right.default_action,
+        )
+    except InvalidCIDRError:
+        # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
+        raise
+
+
+@app.post(
+    "/explain",
+    response_model=ExplainResponse,
+    tags=["explain"],
+    summary="解释一段 IPv4 地址空间由哪条规则或默认动作最终裁决",
+)
+def explain(request: ExplainRequest) -> dict:
+    """沿用 /analyze 的 CIDR 校验与“首条匹配规则生效”顺序语义。
+
+    仅在 ``query`` 范围内归因：每条规则分到的是其未被此前规则覆盖、
+    且落在 query 内的地址；未命中任何规则的部分归于 ``default_action``。
+    返回的 attribution 不重不漏覆盖整个 query，按规则索引升序、默认项
+    最后；每项地址集合无损压缩为最少 CIDR。基于区间归并计算，不逐地址
+    枚举。空规则集时整个 query 归于默认动作。
+    """
+    try:
+        return explain_query(
+            [(r.action, r.cidr) for r in request.rules],
+            request.default_action,
+            request.query,
         )
     except InvalidCIDRError:
         # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422

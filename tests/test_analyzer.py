@@ -11,6 +11,7 @@ from app.analyzer import (
     build_decision_intervals,
     compare_rule_sets,
     compress_intervals,
+    explain_query,
     merge_intervals,
     parse_cidr_v4,
     range_to_cidrs,
@@ -403,3 +404,157 @@ def test_compare_random_rules_oracle():
             assert group["address_count"] == len(within) + V4_SPACE - 256
 
         assert result["equivalent"] == (not expected and not external)
+
+
+# ---------- 地址空间裁决解释（/explain 核心） ----------
+
+def test_explain_basic_attribution_first_match():
+    result = explain_query(
+        [
+            ("allow", "10.0.0.0/8"),
+            ("deny", "10.1.0.0/16"),  # 被规则 0 完全遮蔽，不应出现
+            ("allow", "192.168.0.0/16"),  # 与 query 无交集，不应出现
+            ("deny", "10.0.0.0/7"),
+        ],
+        "allow",
+        "10.0.0.0/7",
+    )
+    assert result["query"] == "10.0.0.0/7"
+    assert result["total_addresses"] == 1 << 25
+    assert result["attribution"] == [
+        {
+            "source": "rule",
+            "rule_index": 0,
+            "action": "allow",
+            "address_count": 1 << 24,
+            "cidrs": ["10.0.0.0/8"],
+        },
+        {
+            "source": "rule",
+            "rule_index": 3,
+            "action": "deny",
+            "address_count": 1 << 24,
+            "cidrs": ["11.0.0.0/8"],
+        },
+    ]
+
+
+def test_explain_default_fills_gaps_and_comes_last():
+    result = explain_query([("allow", "10.0.0.0/9")], "deny", "10.0.0.0/8")
+    assert result["attribution"] == [
+        {
+            "source": "rule",
+            "rule_index": 0,
+            "action": "allow",
+            "address_count": 1 << 23,
+            "cidrs": ["10.0.0.0/9"],
+        },
+        {
+            "source": "default",
+            "rule_index": None,
+            "action": "deny",
+            "address_count": 1 << 23,
+            "cidrs": ["10.128.0.0/9"],
+        },
+    ]
+
+
+def test_explain_bare_ip_query_and_empty_rules():
+    # 纯 IP 按 /32；空规则集时整个 query 归默认动作
+    result = explain_query([], "allow", "8.8.8.8")
+    assert result["query"] == "8.8.8.8/32"
+    assert result["total_addresses"] == 1
+    assert result["attribution"] == [
+        {
+            "source": "default",
+            "rule_index": None,
+            "action": "allow",
+            "address_count": 1,
+            "cidrs": ["8.8.8.8/32"],
+        }
+    ]
+
+
+def test_explain_rule_clipped_to_query():
+    # 规则超出 query 的部分不计入归因
+    result = explain_query([("deny", "0.0.0.0/0")], "allow", "10.0.0.0/8")
+    assert result["attribution"] == [
+        {
+            "source": "rule",
+            "rule_index": 0,
+            "action": "deny",
+            "address_count": 1 << 24,
+            "cidrs": ["10.0.0.0/8"],
+        }
+    ]
+
+
+def test_explain_rejects_invalid_inputs():
+    with pytest.raises(InvalidCIDRError):
+        explain_query([], "deny", "10.0.0.1/8")  # 主机位非零
+    with pytest.raises(InvalidCIDRError):
+        explain_query([], "deny", "2001:db8::/32")  # IPv6
+    with pytest.raises(InvalidCIDRError):
+        explain_query([("allow", "garbage")], "deny", "10.0.0.0/8")
+    with pytest.raises(ValueError):
+        explain_query([("permit", "10.0.0.0/8")], "deny", "10.0.0.0/8")
+    with pytest.raises(ValueError):
+        explain_query([], "PERMIT", "10.0.0.0/8")
+
+
+def test_explain_random_rules_oracle():
+    """与逐地址暴力 oracle 对比（query 取 10.0.0.0/24，规则含范围外 CIDR）。"""
+    rng = random.Random(20260918)
+    pool = [
+        str(n)
+        for base in ("10.0.0.0/24", "10.1.0.0/24")
+        for n in ip_network(base).subnets(new_prefix=30)
+    ]
+    q_start, q_end, q_text = parse_cidr_v4("10.0.0.0/24")
+
+    for _ in range(100):
+        rules = [
+            (rng.choice(["allow", "deny"]), rng.choice(pool))
+            for _ in range(rng.randint(0, 8))
+        ]
+        default = rng.choice(["allow", "deny"])
+
+        result = explain_query(rules, default, "10.0.0.0/24")
+        assert result["query"] == q_text
+        assert result["total_addresses"] == 256
+
+        parsed = [(a, parse_cidr_v4(c)) for a, c in rules]
+
+        def decide(value):
+            for idx, (action, (start, end, _)) in enumerate(parsed):
+                if start <= value <= end:
+                    return ("rule", idx, action)
+            return ("default", None, default)
+
+        expected: dict = {}
+        for value in range(q_start, q_end + 1):
+            expected.setdefault(decide(value), set()).add(value)
+
+        got = result["attribution"]
+        # 顺序：规则项按索引升序，默认项（至多一个）在最后
+        rule_indexes = [
+            item["rule_index"] for item in got if item["source"] == "rule"
+        ]
+        assert rule_indexes == sorted(rule_indexes)
+        defaults = [item for item in got if item["source"] == "default"]
+        assert len(defaults) <= 1
+        if defaults:
+            assert got[-1] is defaults[0]
+            assert defaults[0]["rule_index"] is None
+
+        keys = {(i["source"], i["rule_index"], i["action"]) for i in got}
+        assert keys == set(expected)
+        for item in got:
+            want = expected[(item["source"], item["rule_index"], item["action"])]
+            nets = [ip_network(c) for c in item["cidrs"]]
+            assert {int(addr) for net in nets for addr in net} == want  # 不重不漏
+            assert item["address_count"] == len(want)
+            # 最少 CIDR 与标准库 oracle 一致
+            assert item["cidrs"] == [str(c) for c in collapse_addresses(nets)]
+        # 不重不漏覆盖整个 query
+        assert sum(item["address_count"] for item in got) == 256
