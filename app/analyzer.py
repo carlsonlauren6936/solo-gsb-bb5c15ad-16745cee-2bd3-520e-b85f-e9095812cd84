@@ -246,6 +246,77 @@ def build_decision_intervals(
     return partition
 
 
+def explain_query(
+    rules: Sequence[tuple[str, str]],
+    default_action: str,
+    query: str,
+) -> dict:
+    """解释一段 IPv4 地址空间由哪条规则或默认动作最终裁决。
+
+    沿用“首条匹配规则生效”的顺序语义，但只在 ``query`` 范围内归因：
+    query 中的每个地址归属于首条命中它的规则；未被任何规则命中的部分
+    归于 ``default_action``。
+
+    返回可直接 JSON 序列化的字典：规范化后的 ``query``、地址总数
+    ``total_addresses``，以及 ``attribution`` 列表。归因项按规则索引
+    升序排列、默认项最后；每项给出 ``source``（rule/default）、
+    ``rule_index``（默认项为 None）、``action``、``address_count`` 与
+    无损压缩后的最少 ``cidrs``。所有项不重不漏地覆盖整个 query。
+    全程只做区间运算，不逐地址枚举。
+    """
+    default_action = normalize_action(default_action)
+    q_start, q_end, q_cidr = parse_cidr_v4(query)
+
+    covered: list[tuple[int, int]] = []
+    attributed: list[tuple[int, str, list[tuple[int, int]]]] = []
+
+    for index, (action, raw_cidr) in enumerate(rules):
+        action = normalize_action(action)
+        start, end, _ = parse_cidr_v4(raw_cidr)
+        # 首条匹配语义下本规则的生效碎片，再裁剪到 query 范围
+        remaining = subtract_covered((start, end), covered)
+        fragments = [
+            (max(frag_start, q_start), min(frag_end, q_end))
+            for frag_start, frag_end in remaining
+            if max(frag_start, q_start) <= min(frag_end, q_end)
+        ]
+        if fragments:
+            attributed.append((index, action, fragments))
+        covered = merge_intervals([*covered, (start, end)])
+
+    # query 内未命中任何规则的部分归于默认动作
+    default_fragments = subtract_covered((q_start, q_end), covered)
+
+    attribution = [
+        {
+            "source": "rule",
+            "rule_index": index,
+            "action": action,
+            "address_count": sum(end - start + 1 for start, end in fragments),
+            "cidrs": compress_intervals(fragments),
+        }
+        for index, action, fragments in attributed
+    ]
+    if default_fragments:
+        attribution.append(
+            {
+                "source": "default",
+                "rule_index": None,
+                "action": default_action,
+                "address_count": sum(
+                    end - start + 1 for start, end in default_fragments
+                ),
+                "cidrs": compress_intervals(default_fragments),
+            }
+        )
+
+    return {
+        "query": q_cidr,
+        "total_addresses": q_end - q_start + 1,
+        "attribution": attribution,
+    }
+
+
 def compare_rule_sets(
     left_rules: Sequence[tuple[str, str]],
     left_default: str,
